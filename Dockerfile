@@ -6,6 +6,8 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y python3 make g++ && rm -rf /var/lib/apt/lists/*
 
 COPY package*.json .npmrc ./
+# Locally built IronRDP packages referenced by package.json (test build only)
+COPY local-packages ./local-packages
 
 FROM base AS builder-dev
 
