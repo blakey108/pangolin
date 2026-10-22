@@ -1,6 +1,7 @@
 import { Request, Response, NextFunction } from "express";
 import { z } from "zod";
-import { db, resources, targets } from "@server/db";
+import { db, idp, idpOidcConfig, idpOrg, resources, targets } from "@server/db";
+import { isEntraAuthority } from "@server/lib/idp/entraRdp";
 import { eq, and, inArray } from "drizzle-orm";
 import response from "@server/lib/response";
 import HttpCode from "@server/types/HttpCode";
@@ -73,6 +74,21 @@ export async function getBrowserTarget(
             ? decrypt(row.authToken, config.getRawConfig().server.secret!)
             : "";
 
+        const orgIdps = await db
+            .select({
+                idpId: idp.idpId,
+                name: idp.name,
+                authUrl: idpOidcConfig.authUrl
+            })
+            .from(idpOrg)
+            .innerJoin(idp, eq(idp.idpId, idpOrg.idpId))
+            .innerJoin(idpOidcConfig, eq(idpOidcConfig.idpId, idp.idpId))
+            .where(and(eq(idpOrg.orgId, row.orgId), eq(idp.type, "oidc")));
+
+        const entraIdps = orgIdps
+            .filter((orgIdp) => isEntraAuthority(orgIdp.authUrl))
+            .map(({ idpId, name }) => ({ idpId, name }));
+
         return response<GetBrowserTargetResponse>(res, {
             data: {
                 ip: row.ip,
@@ -83,7 +99,8 @@ export async function getBrowserTarget(
                 orgId: row.orgId,
                 resourceId: row.resourceId,
                 niceId: row.niceId,
-                name: row.name ?? ""
+                name: row.name ?? "",
+                entraIdps
             },
             success: true,
             error: false,
