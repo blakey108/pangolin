@@ -14,7 +14,7 @@
 import { Request, Response, NextFunction } from "express";
 import { z } from "zod";
 import { db, idpOrg, loginPage, loginPageOrg, resources } from "@server/db";
-import { eq, and } from "drizzle-orm";
+import { eq, and, inArray } from "drizzle-orm";
 import response from "@server/lib/response";
 import HttpCode from "@server/types/HttpCode";
 import createHttpError from "http-errors";
@@ -22,21 +22,41 @@ import logger from "@server/logger";
 import { fromError } from "zod-validation-error";
 import { LoadLoginPageResponse } from "@server/routers/loginPage/types";
 
-const querySchema = z.object({
-    resourceId: z.coerce.number<number>().int().positive().optional(),
-    idpId: z.coerce.number<number>().int().positive().optional(),
-    orgId: z.string().min(1).optional(),
-    fullDomain: z.string().min(1)
-});
+const querySchema = z
+    .object({
+        resourceId: z.coerce.number<number>().int().positive().optional(),
+        idpId: z.coerce.number<number>().int().positive().optional(),
+        orgId: z.string().min(1).optional(),
+        fullDomain: z.string().min(1).optional()
+    })
+    .refine((data) => Boolean(data.fullDomain || data.orgId), {
+        error: "orgId or fullDomain is required"
+    });
 
-async function query(orgId: string | undefined, fullDomain: string) {
-    if (!orgId) {
+// A Host header can carry a port (e.g. "login.example.com:443"); login pages
+// are stored by bare domain.
+function stripPort(host: string): string {
+    return host.replace(/:\d{1,5}$/, "");
+}
+
+// orgIds holds every org the caller may belong to: one for a resource or an
+// explicit orgId, but all linked orgs for an IdP, since one IdP can be
+// imported into several orgs.
+async function query(
+    orgIds: string[] | undefined,
+    fullDomain: string | undefined
+) {
+    if (orgIds && orgIds.length === 0) {
+        return null;
+    }
+
+    if (orgIds && !fullDomain) {
         const [res] = await db
             .select()
-            .from(loginPage)
-            .where(eq(loginPage.fullDomain, fullDomain))
+            .from(loginPageOrg)
+            .where(inArray(loginPageOrg.orgId, orgIds))
             .innerJoin(
-                loginPageOrg,
+                loginPage,
                 eq(loginPage.loginPageId, loginPageOrg.loginPageId)
             )
             .limit(1);
@@ -51,22 +71,21 @@ async function query(orgId: string | undefined, fullDomain: string) {
         };
     }
 
-    const [orgLink] = await db
-        .select()
-        .from(loginPageOrg)
-        .where(eq(loginPageOrg.orgId, orgId));
-
-    if (!orgLink) {
+    if (!fullDomain) {
         return null;
     }
 
     const [res] = await db
         .select()
         .from(loginPage)
+        .innerJoin(
+            loginPageOrg,
+            eq(loginPage.loginPageId, loginPageOrg.loginPageId)
+        )
         .where(
             and(
-                eq(loginPage.loginPageId, orgLink.loginPageId),
-                eq(loginPage.fullDomain, fullDomain)
+                eq(loginPage.fullDomain, fullDomain),
+                orgIds ? inArray(loginPageOrg.orgId, orgIds) : undefined
             )
         )
         .limit(1);
@@ -76,8 +95,8 @@ async function query(orgId: string | undefined, fullDomain: string) {
     }
 
     return {
-        ...res,
-        orgId: orgLink.orgId
+        ...res.loginPage,
+        orgId: res.loginPageOrg.orgId
     };
 }
 
@@ -97,9 +116,12 @@ export async function loadLoginPage(
             );
         }
 
-        const { resourceId, idpId, fullDomain } = parsedQuery.data;
+        const { resourceId, idpId } = parsedQuery.data;
+        const fullDomain = parsedQuery.data.fullDomain
+            ? stripPort(parsedQuery.data.fullDomain)
+            : undefined;
 
-        let orgId: string | undefined = undefined;
+        let orgIds: string[] | undefined = undefined;
         if (resourceId) {
             const [resource] = await db
                 .select()
@@ -113,25 +135,25 @@ export async function loadLoginPage(
                 );
             }
 
-            orgId = resource.orgId;
+            orgIds = [resource.orgId];
         } else if (idpId) {
-            const [idpOrgLink] = await db
-                .select()
+            const idpOrgLinks = await db
+                .select({ orgId: idpOrg.orgId })
                 .from(idpOrg)
                 .where(eq(idpOrg.idpId, idpId));
 
-            if (!idpOrgLink) {
+            if (idpOrgLinks.length === 0) {
                 return next(
                     createHttpError(HttpCode.NOT_FOUND, "IdP not found")
                 );
             }
 
-            orgId = idpOrgLink.orgId;
+            orgIds = idpOrgLinks.map((link) => link.orgId);
         } else if (parsedQuery.data.orgId) {
-            orgId = parsedQuery.data.orgId;
+            orgIds = [parsedQuery.data.orgId];
         }
 
-        const loginPage = await query(orgId, fullDomain);
+        const loginPage = await query(orgIds, fullDomain);
 
         if (!loginPage) {
             return next(

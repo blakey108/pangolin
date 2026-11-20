@@ -9,6 +9,7 @@ import { LoginFormIDP } from "@app/components/LoginForm";
 import { ListOrgIdpsResponse } from "@server/routers/orgIdp/types";
 import { build } from "@server/build";
 import { headers } from "next/headers";
+import { hostWithoutPort } from "@app/lib/hostWithoutPort";
 import {
     LoadLoginPageBrandingResponse,
     LoadLoginPageResponse
@@ -60,9 +61,9 @@ export default async function OrgAuthPage(props: {
     const user = await getUser({ skipCheckVerifyEmail: true });
 
     const allHeaders = await headers();
-    const host = allHeaders.get("host");
+    const host = hostWithoutPort(allHeaders.get("host"));
 
-    const expectedHost = env.app.dashboardUrl.split("//")[1];
+    const expectedHost = hostWithoutPort(env.app.dashboardUrl.split("//")[1]);
 
     let redirectToUrl: string | undefined;
     let loginPage: LoadLoginPageResponse | undefined;
@@ -133,30 +134,25 @@ export default async function OrgAuthPage(props: {
         return <OrgSelectionForm />;
     }
 
-    let loginIdps: LoginFormIDP[] = [];
-    if (build === "saas") {
-        const idpsRes = await priv.get<AxiosResponse<ListOrgIdpsResponse>>(
-            `/org/${loginPage.orgId}/idp`
-        );
+    const idpsRes = await priv.get<AxiosResponse<ListOrgIdpsResponse>>(
+        `/org/${loginPage.orgId}/idp`
+    );
 
-        loginIdps = idpsRes.data.data.idps.map((idp) => ({
-            idpId: idp.idpId,
-            name: idp.name,
-            variant: idp.variant
-        })) as LoginFormIDP[];
-    }
+    const loginIdps = idpsRes.data.data.idps.map((idp) => ({
+        idpId: idp.idpId,
+        name: idp.name,
+        variant: idp.variant
+    })) as LoginFormIDP[];
 
     let branding: LoadLoginPageBrandingResponse | null = null;
-    if (build === "saas") {
-        try {
-            const res = await priv.get<
-                AxiosResponse<LoadLoginPageBrandingResponse>
-            >(`/login-page-branding?orgId=${loginPage.orgId}`);
-            if (res.status === 200) {
-                branding = res.data.data;
-            }
-        } catch (error) {}
-    }
+    try {
+        const res = await priv.get<
+            AxiosResponse<LoadLoginPageBrandingResponse>
+        >(`/login-page-branding?orgId=${loginPage.orgId}`);
+        if (res.status === 200) {
+            branding = res.data.data;
+        }
+    } catch (error) {}
 
     return (
         <OrgLoginPage

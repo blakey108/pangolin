@@ -56,6 +56,7 @@ export type ClientRow = {
     orgId: string;
     online: boolean;
     olmVersion?: string;
+    agentVersion?: string;
     olmUpdateAvailable: boolean;
     userId: string | null;
     username: string | null;
@@ -383,7 +384,52 @@ export default function MachineClientsTable({
             {
                 accessorKey: "client",
                 friendlyName: t("agent"),
-                header: () => <span className="px-3">{t("agent")}</span>,
+                header: () => (
+                    <ColumnFilterButton
+                        options={[
+                            {
+                                value: "macos",
+                                label: "Pangolin macOS"
+                            },
+                            {
+                                value: "ios",
+                                label: "Pangolin iOS"
+                            },
+                            {
+                                value: "ipados",
+                                label: "Pangolin iPadOS"
+                            },
+                            {
+                                value: "android",
+                                label: "Pangolin Android"
+                            },
+                            {
+                                value: "windows",
+                                label: "Pangolin Windows"
+                            },
+                            {
+                                value: "cli",
+                                label: "Pangolin CLI"
+                            },
+                            {
+                                value: "olm",
+                                label: "Olm CLI"
+                            },
+                            {
+                                value: "unknown",
+                                label: t("unknown")
+                            }
+                        ]}
+                        selectedValue={searchParams.get("agent") ?? undefined}
+                        onValueChange={(value) =>
+                            handleFilterChange("agent", value)
+                        }
+                        searchPlaceholder={t("searchPlaceholder")}
+                        emptyMessage={t("emptySearchOptions")}
+                        label={t("agent")}
+                        className="p-3"
+                    />
+                ),
                 cell: ({ row }) => {
                     const originalRow = row.original;
 
@@ -397,10 +443,16 @@ export default function MachineClientsTable({
                         "Olm CLI": "olm"
                     };
 
+                    // agentVersion was added after olmVersion, and older olm
+                    // clients report the app version in olmVersion, so fall
+                    // back to it for rows that have not re-registered yet.
+                    const displayedVersion =
+                        originalRow.agentVersion ?? originalRow.olmVersion;
+
                     let updateAvailable = false;
 
                     if (
-                        originalRow.olmVersion &&
+                        displayedVersion &&
                         originalRow.agent &&
                         latestPlatformVersions
                     ) {
@@ -409,13 +461,14 @@ export default function MachineClientsTable({
                         ] as keyof LatestVersionResponse;
 
                         if (agent in latestPlatformVersions) {
-                            const agentVersion = latestPlatformVersions[agent];
+                            const latestAgentVersion =
+                                latestPlatformVersions[agent];
 
                             updateAvailable = Boolean(
-                                semver.valid(originalRow.olmVersion) &&
+                                semver.valid(displayedVersion) &&
                                 semver.lt(
-                                    originalRow.olmVersion,
-                                    agentVersion.latestVersion
+                                    displayedVersion,
+                                    latestAgentVersion.latestVersion
                                 )
                             );
                         }
@@ -423,11 +476,11 @@ export default function MachineClientsTable({
 
                     return (
                         <div className="flex items-center space-x-1">
-                            {originalRow.agent && originalRow.olmVersion ? (
+                            {originalRow.agent && displayedVersion ? (
                                 <Badge variant="secondary">
                                     {originalRow.agent +
                                         " v" +
-                                        originalRow.olmVersion}
+                                        displayedVersion}
                                 </Badge>
                             ) : (
                                 "-"
