@@ -15,8 +15,7 @@ import {
     SelectValue
 } from "@app/components/ui/select";
 import { Tabs, TabsList, TabsTrigger } from "@app/components/ui/tabs";
-import type { RdpEntraMessage } from "@app/components/RdpEntraCallback";
-import { RDP_ENTRA_MESSAGE_TYPE } from "@app/components/RdpEntraCallback";
+import { runRdpEntraPopup } from "@app/lib/rdpEntraPopup";
 import {
     Form,
     FormControl,
@@ -89,7 +88,7 @@ type RdpCredentialsForm = {
     // keeps NLA on for Entra joined hosts.
     authMode: "password" | "entra";
     entraIdpId: string;
-    // Computer name of the host as registered in Entra ID
+    // Device ID or computer name of the host in Entra ID
     entraDeviceName: string;
 };
 
@@ -108,9 +107,6 @@ const DEFAULT_RDP_CREDENTIALS: RdpCredentialsForm = {
 
 // Entra device names are NetBIOS-style computer names without a suffix.
 const ENTRA_DEVICE_NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$/;
-
-// How long to wait for the Microsoft sign-in popup to report back.
-const ENTRA_SIGN_IN_TIMEOUT_MS = 5 * 60 * 1000;
 
 type EntraSignIn = {
     accessToken: string;
@@ -153,6 +149,9 @@ export default function RdpClient({
     const STORAGE_KEY = "pangolin_rdp_credentials";
     const resourceName = target?.name?.trim() || null;
     const entraIdps = target?.entraIdps ?? [];
+    // Set on the resource by an admin; used unless the user enters another
+    // device.
+    const entraDeviceId = target?.rdpEntraDeviceId ?? null;
 
     const formSchema = z
         .object({
@@ -170,6 +169,9 @@ export default function RdpClient({
         .superRefine((values, ctx) => {
             if (values.authMode === "entra") {
                 if (values.entraDeviceName.length === 0) {
+                    if (entraDeviceId) {
+                        return;
+                    }
                     ctx.addIssue({
                         code: z.ZodIssueCode.custom,
                         path: ["entraDeviceName"],
@@ -222,6 +224,11 @@ export default function RdpClient({
             const restored = { ...DEFAULT_RDP_CREDENTIALS, ...saved };
             if (restored.authMode === "entra" && entraIdps.length === 0) {
                 restored.authMode = "password";
+            }
+            if (entraDeviceId) {
+                // The resource's own device is the default; a device from an
+                // earlier session must not silently replace it.
+                restored.entraDeviceName = "";
             }
             form.reset(restored);
         });
@@ -365,29 +372,33 @@ export default function RdpClient({
         }
     };
 
-    // Runs the Microsoft sign-in in a popup on the dashboard domain and
-    // resolves with a token bound to a fresh key held by this page.
+    const runEntraPopup = (
+        idpId: string,
+        params: () => Promise<Record<string, string>>
+    ) =>
+        runRdpEntraPopup({
+            dashboardUrl: env.app.dashboardUrl,
+            idpId,
+            params,
+            messages: {
+                noIdp: t("rdpEntraNoIdp"),
+                popupBlocked: t("rdpEntraPopupBlocked"),
+                cancelled: t("rdpEntraSignInCancelled"),
+                timeout: t("rdpEntraSignInTimeout")
+            }
+        });
+
+    // Runs the Microsoft sign-in and resolves with a token bound to a fresh
+    // key held by this page.
     const signInWithEntra = async (
         values: RdpCredentialsForm,
         reqCnfOf: (popKey: string) => string
     ): Promise<EntraSignIn> => {
         const idpId = values.entraIdpId || String(entraIdps[0]?.idpId ?? "");
-        if (!idpId) {
-            throw new Error(t("rdpEntraNoIdp"));
-        }
+        const device = values.entraDeviceName || entraDeviceId || "";
+        let popKey = "";
 
-        // Open the window before any await so the click still counts as a
-        // user gesture for the popup blocker.
-        const popup = window.open(
-            "about:blank",
-            "pangolin-rdp-entra",
-            "popup,width=520,height=720"
-        );
-        if (!popup) {
-            throw new Error(t("rdpEntraPopupBlocked"));
-        }
-
-        try {
+        const result = await runEntraPopup(idpId, async () => {
             const keyPair = await crypto.subtle.generateKey(
                 {
                     name: "RSASSA-PKCS1-v1_5",
@@ -402,63 +413,54 @@ export default function RdpClient({
                 "pkcs8",
                 keyPair.privateKey
             );
-            const popKey = btoa(String.fromCharCode(...new Uint8Array(pkcs8)));
-            const reqCnf = reqCnfOf(popKey);
+            popKey = btoa(String.fromCharCode(...new Uint8Array(pkcs8)));
+            return { deviceName: device, reqCnf: reqCnfOf(popKey) };
+        });
 
-            const dashboardOrigin = new URL(env.app.dashboardUrl).origin;
-            const startUrl = new URL(
-                `/auth/idp/${idpId}/rdp/start`,
-                dashboardOrigin
-            );
-            startUrl.searchParams.set("deviceName", values.entraDeviceName);
-            startUrl.searchParams.set("reqCnf", reqCnf);
-            startUrl.searchParams.set("origin", window.location.origin);
-            popup.location.href = startUrl.toString();
+        if (
+            !result.accessToken ||
+            !result.nonce ||
+            result.deviceName !== device
+        ) {
+            throw new Error(t("rdpEntraSignInFailed"));
+        }
 
-            const result = await new Promise<RdpEntraMessage>(
-                (resolve, reject) => {
-                    const cleanup = () => {
-                        window.removeEventListener("message", onMessage);
-                        clearInterval(closedPoll);
-                        clearTimeout(timeout);
-                    };
-                    const onMessage = (event: MessageEvent) => {
-                        if (event.origin !== dashboardOrigin) return;
-                        const data = event.data as RdpEntraMessage | null;
-                        if (data?.type !== RDP_ENTRA_MESSAGE_TYPE) return;
-                        cleanup();
-                        resolve(data);
-                    };
-                    const closedPoll = setInterval(() => {
-                        if (popup.closed) {
-                            cleanup();
-                            reject(new Error(t("rdpEntraSignInCancelled")));
-                        }
-                    }, 500);
-                    const timeout = setTimeout(() => {
-                        cleanup();
-                        reject(new Error(t("rdpEntraSignInTimeout")));
-                    }, ENTRA_SIGN_IN_TIMEOUT_MS);
-                    window.addEventListener("message", onMessage);
-                }
-            );
+        return {
+            accessToken: result.accessToken,
+            nonce: result.nonce,
+            popKey,
+            deviceName: device
+        };
+    };
 
-            if (result.error || !result.accessToken || !result.nonce) {
-                throw new Error(result.error ?? t("rdpEntraSignInFailed"));
+    const [entraDevices, setEntraDevices] = useState<
+        { deviceId: string; name: string }[] | null
+    >(null);
+    const [loadingEntraDevices, setLoadingEntraDevices] = useState(false);
+
+    const loadEntraDevices = async () => {
+        const idpId =
+            form.getValues("entraIdpId") || String(entraIdps[0]?.idpId ?? "");
+        setLoadingEntraDevices(true);
+        try {
+            const result = await runEntraPopup(idpId, async () => ({
+                purpose: "devices"
+            }));
+            const devices = result.devices ?? [];
+            setEntraDevices(devices);
+            if (devices.length === 1) {
+                form.setValue("entraDeviceName", devices[0].deviceId, {
+                    shouldValidate: true
+                });
             }
-            if (result.deviceName !== values.entraDeviceName) {
-                throw new Error(t("rdpEntraSignInFailed"));
-            }
-
-            return {
-                accessToken: result.accessToken,
-                nonce: result.nonce,
-                popKey,
-                deviceName: values.entraDeviceName
-            };
         } catch (err) {
-            if (!popup.closed) popup.close();
-            throw err;
+            toast({
+                variant: "destructive",
+                title: t("rdpEntraDevicesFailed"),
+                description: err instanceof Error ? err.message : String(err)
+            });
+        } finally {
+            setLoadingEntraDevices(false);
         }
     };
 
@@ -774,14 +776,95 @@ export default function RdpClient({
                                                         <FormControl>
                                                             <Input
                                                                 autoComplete="off"
+                                                                placeholder={
+                                                                    entraDeviceId ??
+                                                                    undefined
+                                                                }
                                                                 {...field}
                                                             />
                                                         </FormControl>
                                                         <FormDescription>
                                                             {t(
-                                                                "rdpEntraDeviceNameDescription"
+                                                                entraDeviceId
+                                                                    ? "rdpEntraDeviceDefaultDescription"
+                                                                    : "rdpEntraDeviceNameDescription"
                                                             )}
                                                         </FormDescription>
+                                                        {entraDevices &&
+                                                            entraDevices.length >
+                                                                0 && (
+                                                                <Select
+                                                                    value={
+                                                                        entraDevices.some(
+                                                                            (
+                                                                                device
+                                                                            ) =>
+                                                                                device.deviceId ===
+                                                                                field.value
+                                                                        )
+                                                                            ? field.value
+                                                                            : ""
+                                                                    }
+                                                                    onValueChange={
+                                                                        field.onChange
+                                                                    }
+                                                                >
+                                                                    <SelectTrigger>
+                                                                        <SelectValue
+                                                                            placeholder={t(
+                                                                                "rdpEntraDeviceSelect"
+                                                                            )}
+                                                                        />
+                                                                    </SelectTrigger>
+                                                                    <SelectContent>
+                                                                        {entraDevices.map(
+                                                                            (
+                                                                                device
+                                                                            ) => (
+                                                                                <SelectItem
+                                                                                    key={
+                                                                                        device.deviceId
+                                                                                    }
+                                                                                    value={
+                                                                                        device.deviceId
+                                                                                    }
+                                                                                >
+                                                                                    {
+                                                                                        device.name
+                                                                                    }
+                                                                                </SelectItem>
+                                                                            )
+                                                                        )}
+                                                                    </SelectContent>
+                                                                </Select>
+                                                            )}
+                                                        {entraDevices &&
+                                                            entraDevices.length ===
+                                                                0 && (
+                                                                <FormDescription>
+                                                                    {t(
+                                                                        "rdpEntraNoDevices"
+                                                                    )}
+                                                                </FormDescription>
+                                                            )}
+                                                        <Button
+                                                            type="button"
+                                                            variant="outline"
+                                                            size="sm"
+                                                            loading={
+                                                                loadingEntraDevices
+                                                            }
+                                                            disabled={
+                                                                loadingEntraDevices
+                                                            }
+                                                            onClick={() =>
+                                                                void loadEntraDevices()
+                                                            }
+                                                        >
+                                                            {t(
+                                                                "rdpEntraChooseDevice"
+                                                            )}
+                                                        </Button>
                                                         <FormMessage />
                                                     </FormItem>
                                                 )}

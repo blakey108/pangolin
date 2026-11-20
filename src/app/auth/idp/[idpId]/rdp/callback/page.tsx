@@ -60,12 +60,20 @@ export default async function Page(props: {
             code: searchParams.code,
             state: searchParams.state
         });
-        const { accessToken, nonce, deviceName } = res.data.data;
+        const data = res.data.data;
         return (
             <RdpEntraCallback
-                origin={res.data.data.origin}
+                origin={data.origin}
                 error={null}
-                result={{ accessToken, nonce, deviceName }}
+                result={
+                    "devices" in data
+                        ? { devices: data.devices }
+                        : {
+                              accessToken: data.accessToken,
+                              nonce: data.nonce,
+                              deviceName: data.deviceName
+                          }
+                }
             />
         );
     } catch (e) {

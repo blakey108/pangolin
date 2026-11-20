@@ -12,6 +12,7 @@ import jsonwebtoken from "jsonwebtoken";
 import config from "@server/lib/config";
 import { decrypt } from "@server/lib/crypto";
 import {
+    ENTRA_DEVICE_LIST_SCOPE,
     isEntraAuthority,
     isValidEntraDeviceName,
     rdpEntraRedirectUrl,
@@ -24,19 +25,27 @@ const paramsSchema = z
     })
     .strict();
 
-const bodySchema = z.strictObject({
-    // Entra device name of the RDP host
-    deviceName: z.string().min(1).max(63),
-    // Proof-of-possession binding computed by the RDP client for its key
-    reqCnf: z.string().min(1).max(512),
-    // Origin of the browser RDP page that receives the token
-    origin: z.string().url()
-});
+const bodySchema = z.discriminatedUnion("purpose", [
+    z.strictObject({
+        purpose: z.literal("token"),
+        deviceName: z.string().min(1).max(63),
+        // Proof-of-possession binding computed by the RDP client for its key
+        reqCnf: z.string().min(1).max(512),
+        // Origin of the browser RDP page that receives the token
+        origin: z.string().url()
+    }),
+    z.strictObject({
+        purpose: z.literal("devices"),
+        origin: z.string().url()
+    })
+]);
 
 export const RDP_ENTRA_STATE_PURPOSE = "rdp-entra";
+export const RDP_ENTRA_DEVICES_STATE_PURPOSE = "rdp-entra-devices";
 
 export type RdpEntraState = {
-    purpose: typeof RDP_ENTRA_STATE_PURPOSE;
+    purpose:
+        typeof RDP_ENTRA_STATE_PURPOSE | typeof RDP_ENTRA_DEVICES_STATE_PURPOSE;
     idpId: number;
     state: string;
     codeVerifier: string;
@@ -82,9 +91,13 @@ export async function generateRdpEntraUrl(
         }
 
         const { idpId } = parsedParams.data;
-        const { deviceName, reqCnf, origin } = parsedBody.data;
+        const body = parsedBody.data;
+        const { origin } = body;
+        const listDevices = body.purpose === "devices";
+        const deviceName = body.purpose === "token" ? body.deviceName : "";
+        const reqCnf = body.purpose === "token" ? body.reqCnf : "";
 
-        if (!isValidEntraDeviceName(deviceName)) {
+        if (!listDevices && !isValidEntraDeviceName(deviceName)) {
             return next(
                 createHttpError(
                     HttpCode.BAD_REQUEST,
@@ -96,6 +109,11 @@ export async function generateRdpEntraUrl(
         // Only a browser RDP page served by this instance may receive tokens;
         // otherwise any site could trick a user into minting one for it.
         const originUrl = new URL(origin);
+        // The dashboard may only list devices, for the resource settings.
+        const isDashboardOrigin =
+            listDevices &&
+            originUrl.origin ===
+                new URL(config.getRawConfig().app.dashboard_url!).origin;
         const [rdpResource] = await db
             .select({ resourceId: resources.resourceId })
             .from(resources)
@@ -108,7 +126,7 @@ export async function generateRdpEntraUrl(
             )
             .limit(1);
 
-        if (!rdpResource) {
+        if (!rdpResource && !isDashboardOrigin) {
             return next(
                 createHttpError(
                     HttpCode.BAD_REQUEST,
@@ -153,7 +171,9 @@ export async function generateRdpEntraUrl(
         const state = arctic.generateState();
 
         const statePayload: RdpEntraState = {
-            purpose: RDP_ENTRA_STATE_PURPOSE,
+            purpose: listDevices
+                ? RDP_ENTRA_DEVICES_STATE_PURPOSE
+                : RDP_ENTRA_STATE_PURPOSE,
             idpId,
             state,
             codeVerifier,
@@ -173,7 +193,7 @@ export async function generateRdpEntraUrl(
             stateJwt,
             arctic.CodeChallengeMethod.S256,
             codeVerifier,
-            [rdpEntraScope(deviceName)]
+            [listDevices ? ENTRA_DEVICE_LIST_SCOPE : rdpEntraScope(deviceName)]
         );
 
         return response<GenerateRdpEntraUrlResponse>(res, {

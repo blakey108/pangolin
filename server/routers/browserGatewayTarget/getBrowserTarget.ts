@@ -1,7 +1,7 @@
 import { Request, Response, NextFunction } from "express";
 import { z } from "zod";
-import { db, idp, idpOidcConfig, idpOrg, resources, targets } from "@server/db";
-import { isEntraAuthority } from "@server/lib/idp/entraRdp";
+import { db, resources, targets } from "@server/db";
+import { listEntraIdpsForOrg } from "@server/lib/idp/entraRdpIdps";
 import { eq, and, inArray } from "drizzle-orm";
 import response from "@server/lib/response";
 import HttpCode from "@server/types/HttpCode";
@@ -48,7 +48,8 @@ export async function getBrowserTarget(
                 name: resources.name,
                 orgId: resources.orgId,
                 pamMode: resources.pamMode,
-                authDaemonMode: resources.authDaemonMode
+                authDaemonMode: resources.authDaemonMode,
+                rdpEntraDeviceId: resources.rdpEntraDeviceId
             })
             .from(targets)
             .innerJoin(resources, eq(targets.resourceId, resources.resourceId))
@@ -74,20 +75,7 @@ export async function getBrowserTarget(
             ? decrypt(row.authToken, config.getRawConfig().server.secret!)
             : "";
 
-        const orgIdps = await db
-            .select({
-                idpId: idp.idpId,
-                name: idp.name,
-                authUrl: idpOidcConfig.authUrl
-            })
-            .from(idpOrg)
-            .innerJoin(idp, eq(idp.idpId, idpOrg.idpId))
-            .innerJoin(idpOidcConfig, eq(idpOidcConfig.idpId, idp.idpId))
-            .where(and(eq(idpOrg.orgId, row.orgId), eq(idp.type, "oidc")));
-
-        const entraIdps = orgIdps
-            .filter((orgIdp) => isEntraAuthority(orgIdp.authUrl))
-            .map(({ idpId, name }) => ({ idpId, name }));
+        const entraIdps = await listEntraIdpsForOrg(row.orgId);
 
         return response<GetBrowserTargetResponse>(res, {
             data: {
@@ -100,7 +88,8 @@ export async function getBrowserTarget(
                 resourceId: row.resourceId,
                 niceId: row.niceId,
                 name: row.name ?? "",
-                entraIdps
+                entraIdps,
+                rdpEntraDeviceId: row.rdpEntraDeviceId
             },
             success: true,
             error: false,

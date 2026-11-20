@@ -10,4 +10,5 @@ export type GetBrowserTargetResponse = {
     authDaemonMode: "site" | "remote" | "native" | null;
     // Entra OIDC identity providers of the org, offered for RDP sign-in
     entraIdps: { idpId: number; name: string }[];
+    rdpEntraDeviceId: string | null;
 };

@@ -19,6 +19,7 @@ export const dynamic = "force-dynamic";
 export default async function Page(props: {
     params: Promise<{ idpId: string }>;
     searchParams: Promise<{
+        purpose?: string;
         deviceName?: string;
         reqCnf?: string;
         origin?: string;
@@ -34,11 +35,14 @@ export default async function Page(props: {
     try {
         const res = await priv.post<AxiosResponse<GenerateRdpEntraUrlResponse>>(
             `/idp/${params.idpId}/rdp-entra/generate-url`,
-            {
-                deviceName: searchParams.deviceName ?? "",
-                reqCnf: searchParams.reqCnf ?? "",
-                origin: origin ?? ""
-            }
+            searchParams.purpose === "devices"
+                ? { purpose: "devices", origin: origin ?? "" }
+                : {
+                      purpose: "token",
+                      deviceName: searchParams.deviceName ?? "",
+                      reqCnf: searchParams.reqCnf ?? "",
+                      origin: origin ?? ""
+                  }
         );
         redirectUrl = res.data.data.redirectUrl;
     } catch (e) {

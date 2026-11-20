@@ -18,6 +18,7 @@ export type RdpEntraMessage = {
     deviceName?: string;
     accessToken?: string;
     nonce?: string;
+    devices?: { deviceId: string; name: string }[];
     error?: string;
 };
 
@@ -32,11 +33,14 @@ export default function RdpEntraCallback(props: {
     // Origin of the RDP page, as recorded in the signed state
     origin: string | null;
     error: string | null;
-    result: {
-        accessToken: string;
-        nonce: string;
-        deviceName: string;
-    } | null;
+    result:
+        | {
+              accessToken: string;
+              nonce: string;
+              deviceName: string;
+          }
+        | { devices: { deviceId: string; name: string }[] }
+        | null;
 }) {
     const t = useTranslations();
     const [delivered, setDelivered] = useState(false);
@@ -48,12 +52,17 @@ export default function RdpEntraCallback(props: {
         }
 
         const message: RdpEntraMessage = props.result
-            ? {
-                  type: RDP_ENTRA_MESSAGE_TYPE,
-                  deviceName: props.result.deviceName,
-                  accessToken: props.result.accessToken,
-                  nonce: props.result.nonce
-              }
+            ? "devices" in props.result
+                ? {
+                      type: RDP_ENTRA_MESSAGE_TYPE,
+                      devices: props.result.devices
+                  }
+                : {
+                      type: RDP_ENTRA_MESSAGE_TYPE,
+                      deviceName: props.result.deviceName,
+                      accessToken: props.result.accessToken,
+                      nonce: props.result.nonce
+                  }
             : {
                   type: RDP_ENTRA_MESSAGE_TYPE,
                   error: props.error ?? t("rdpEntraCallbackError")

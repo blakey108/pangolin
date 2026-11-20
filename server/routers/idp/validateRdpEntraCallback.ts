@@ -11,13 +11,19 @@ import jsonwebtoken from "jsonwebtoken";
 import config from "@server/lib/config";
 import { decrypt } from "@server/lib/crypto";
 import {
+    EntraDevice,
     EntraTokenError,
+    exchangeEntraGraphCode,
     exchangeRdpEntraCode,
     fetchEntraNonce,
+    listOwnedEntraDevices,
     rdpEntraRedirectUrl,
     rdpEntraScope
 } from "@server/lib/idp/entraRdp";
-import { RDP_ENTRA_STATE_PURPOSE } from "./generateRdpEntraUrl";
+import {
+    RDP_ENTRA_DEVICES_STATE_PURPOSE,
+    RDP_ENTRA_STATE_PURPOSE
+} from "./generateRdpEntraUrl";
 
 const paramsSchema = z
     .object({
@@ -31,7 +37,7 @@ const bodySchema = z.strictObject({
 });
 
 const stateSchema = z.object({
-    purpose: z.literal(RDP_ENTRA_STATE_PURPOSE),
+    purpose: z.enum([RDP_ENTRA_STATE_PURPOSE, RDP_ENTRA_DEVICES_STATE_PURPOSE]),
     idpId: z.number(),
     state: z.string(),
     codeVerifier: z.string(),
@@ -40,12 +46,17 @@ const stateSchema = z.object({
     origin: z.string()
 });
 
-export type ValidateRdpEntraCallbackResponse = {
-    accessToken: string;
-    nonce: string;
-    deviceName: string;
-    origin: string;
-};
+export type ValidateRdpEntraCallbackResponse =
+    | {
+          accessToken: string;
+          nonce: string;
+          deviceName: string;
+          origin: string;
+      }
+    | {
+          devices: EntraDevice[];
+          origin: string;
+      };
 
 /**
  * Completes the Entra RDP sign-in: exchanges the code for a token bound to the
@@ -100,7 +111,8 @@ export async function validateRdpEntraCallback(
             return next(createHttpError(HttpCode.BAD_REQUEST, "Invalid state"));
         }
 
-        const { codeVerifier, reqCnf, deviceName, origin } = parsedState.data;
+        const { purpose, codeVerifier, reqCnf, deviceName, origin } =
+            parsedState.data;
 
         const [existingIdp] = await db
             .select()
@@ -113,11 +125,42 @@ export async function validateRdpEntraCallback(
         }
 
         const clientId = decrypt(existingIdp.idpOidcConfig.clientId, key);
-        const clientSecret = decrypt(
-            existingIdp.idpOidcConfig.clientSecret,
-            key
-        );
         const tokenUrl = existingIdp.idpOidcConfig.tokenUrl;
+
+        if (purpose === RDP_ENTRA_DEVICES_STATE_PURPOSE) {
+            let devices: EntraDevice[];
+            try {
+                // The Graph token stays on the server; only the device list
+                // goes back to the browser.
+                const graphAccessToken = await exchangeEntraGraphCode({
+                    tokenUrl,
+                    clientId,
+                    redirectUri: rdpEntraRedirectUrl(idpId),
+                    code,
+                    codeVerifier
+                });
+                devices = await listOwnedEntraDevices(graphAccessToken);
+            } catch (err) {
+                if (err instanceof EntraTokenError) {
+                    logger.warn("Entra device list request failed", {
+                        code: err.code,
+                        message: err.message
+                    });
+                    return next(
+                        createHttpError(HttpCode.BAD_GATEWAY, err.message)
+                    );
+                }
+                throw err;
+            }
+
+            return response<ValidateRdpEntraCallbackResponse>(res, {
+                data: { devices, origin },
+                success: true,
+                error: false,
+                message: "Entra devices listed",
+                status: HttpCode.OK
+            });
+        }
 
         let accessToken: string;
         let nonce: string;
@@ -125,7 +168,6 @@ export async function validateRdpEntraCallback(
             const tokens = await exchangeRdpEntraCode({
                 tokenUrl,
                 clientId,
-                clientSecret,
                 redirectUri: rdpEntraRedirectUrl(idpId),
                 code,
                 codeVerifier,
