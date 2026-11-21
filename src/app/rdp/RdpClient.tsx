@@ -108,10 +108,25 @@ const DEFAULT_RDP_CREDENTIALS: RdpCredentialsForm = {
 // Entra device names are NetBIOS-style computer names without a suffix.
 const ENTRA_DEVICE_NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$/;
 
+// A device in GUID form is an Entra device ID. The server builds the token
+// scope by the same rule, and the assertion has to name the host the same way.
+const ENTRA_DEVICE_ID_PATTERN =
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const ENTRA_RDP_RESOURCE = "ms-device-service://termsrv.wvd.microsoft.com";
+
+type EntraAssertionParams = {
+    accessToken: string;
+    resourceUri: string;
+    serverNonce: string;
+    aadNonce: string;
+    key: CryptoKeyPair;
+};
+
 type EntraSignIn = {
     accessToken: string;
     nonce: string;
-    popKey: string;
+    // Proof-of-possession key the token is bound to; it never leaves the page.
+    key: CryptoKeyPair;
     deviceName: string;
 };
 
@@ -262,11 +277,12 @@ export default function RdpClient({
         preConnectionBlob: (pcb: string) => unknown;
         kdcProxyUrl: (url: string) => unknown;
         enableCredssp: (enable: boolean) => unknown;
-        rdsAadAccessToken: (token: string) => unknown;
-        rdsAadNonce: (nonce: string) => unknown;
-        rdsAadPopKey: (popKey: string) => unknown;
-        rdsAadHostname: (hostname: string) => unknown;
-        rdsAadPopKeyReqCnf: (popKey: string) => string;
+        entraAssertion: (
+            sign: (serverNonce: string) => Promise<string>
+        ) => unknown;
+        generateEntraPopKey: () => Promise<CryptoKeyPair>;
+        entraReqCnf: (publicKey: CryptoKey) => Promise<string>;
+        signEntraAssertion: (params: EntraAssertionParams) => Promise<string>;
     } | null>(null);
 
     // Load the iron-remote-desktop modules client-side and register the
@@ -288,11 +304,10 @@ export default function RdpClient({
                 preConnectionBlob: rdpMod.preConnectionBlob,
                 kdcProxyUrl: rdpMod.kdcProxyUrl,
                 enableCredssp: rdpMod.enableCredssp,
-                rdsAadAccessToken: rdpMod.rdsAadAccessToken,
-                rdsAadNonce: rdpMod.rdsAadNonce,
-                rdsAadPopKey: rdpMod.rdsAadPopKey,
-                rdsAadHostname: rdpMod.rdsAadHostname,
-                rdsAadPopKeyReqCnf: rdpMod.rdsAadPopKeyReqCnf
+                entraAssertion: rdpMod.entraAssertion,
+                generateEntraPopKey: rdpMod.generateEntraPopKey,
+                entraReqCnf: rdpMod.entraReqCnf,
+                signEntraAssertion: rdpMod.signEntraAssertion
             };
 
             // Store the class; a fresh instance is created per session.
@@ -392,32 +407,24 @@ export default function RdpClient({
     // key held by this page.
     const signInWithEntra = async (
         values: RdpCredentialsForm,
-        reqCnfOf: (popKey: string) => string
+        generatePopKey: () => Promise<CryptoKeyPair>,
+        reqCnfOf: (publicKey: CryptoKey) => Promise<string>
     ): Promise<EntraSignIn> => {
         const idpId = values.entraIdpId || String(entraIdps[0]?.idpId ?? "");
         const device = values.entraDeviceName || entraDeviceId || "";
-        let popKey = "";
+        // Filled in by the popup's parameter callback, after the window opens.
+        const pop: { key?: CryptoKeyPair } = {};
 
         const result = await runEntraPopup(idpId, async () => {
-            const keyPair = await crypto.subtle.generateKey(
-                {
-                    name: "RSASSA-PKCS1-v1_5",
-                    modulusLength: 2048,
-                    publicExponent: new Uint8Array([1, 0, 1]),
-                    hash: "SHA-256"
-                },
-                true,
-                ["sign"]
-            );
-            const pkcs8 = await crypto.subtle.exportKey(
-                "pkcs8",
-                keyPair.privateKey
-            );
-            popKey = btoa(String.fromCharCode(...new Uint8Array(pkcs8)));
-            return { deviceName: device, reqCnf: reqCnfOf(popKey) };
+            pop.key = await generatePopKey();
+            return {
+                deviceName: device,
+                reqCnf: await reqCnfOf(pop.key.publicKey)
+            };
         });
 
         if (
+            !pop.key ||
             !result.accessToken ||
             !result.nonce ||
             result.deviceName !== device
@@ -428,7 +435,7 @@ export default function RdpClient({
         return {
             accessToken: result.accessToken,
             nonce: result.nonce,
-            popKey,
+            key: pop.key,
             deviceName: device
         };
     };
@@ -478,7 +485,11 @@ export default function RdpClient({
         let entra: EntraSignIn | null = null;
         if (useEntra) {
             try {
-                entra = await signInWithEntra(values, exts.rdsAadPopKeyReqCnf);
+                entra = await signInWithEntra(
+                    values,
+                    exts.generateEntraPopKey,
+                    exts.entraReqCnf
+                );
             } catch (err) {
                 setConnecting(false);
                 setSubmitError(err instanceof Error ? err.message : `${err}`);
@@ -573,11 +584,22 @@ export default function RdpClient({
             builder.withExtension(exts.kdcProxyUrl(values.kdcProxyUrl));
         }
         if (entra) {
-            builder
-                .withExtension(exts.rdsAadAccessToken(entra.accessToken))
-                .withExtension(exts.rdsAadNonce(entra.nonce))
-                .withExtension(exts.rdsAadPopKey(entra.popKey))
-                .withExtension(exts.rdsAadHostname(entra.deviceName));
+            const { accessToken, nonce, key, deviceName } = entra;
+            const form = ENTRA_DEVICE_ID_PATTERN.test(deviceName)
+                ? "id"
+                : "name";
+            const resourceUri = `${ENTRA_RDP_RESOURCE}/${form}/${deviceName}`;
+            builder.withExtension(
+                exts.entraAssertion((serverNonce) =>
+                    exts.signEntraAssertion({
+                        accessToken,
+                        resourceUri,
+                        serverNonce,
+                        aadNonce: nonce,
+                        key
+                    })
+                )
+            );
         } else if (!values.nla) {
             builder.withExtension(exts.enableCredssp(false));
         }
